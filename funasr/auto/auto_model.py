@@ -349,6 +349,9 @@ class AutoModel:
             if not kwargs.get("disable_pbar", False)
             else None
         )
+
+        all_speech = []
+        max_len_in_batch = 0
         for i in range(len(res)):
             key = res[i]["key"]
             vadsegments = res[i]["value"]
@@ -358,217 +361,86 @@ class AutoModel:
             speech_lengths = len(speech)
             n = len(vadsegments)
             data_with_index = [(vadsegments[i], i) for i in range(n)]
-            sorted_data = sorted(data_with_index, key=lambda x: x[0][1] - x[0][0])
-            results_sorted = []
 
-            if not len(sorted_data):
-                results_ret_list.append({"key": key, "text": "", "timestamp": []})
-                logging.info("decoding, utt: {}, empty speech".format(key))
-                continue
+            speech_j, _ = slice_padding_audio_samples(
+                speech, speech_lengths, data_with_index
+            )
+            assert len(speech_j) == n
+            for speech in speech_j:
+                max_len_in_batch = max(max_len_in_batch, len(speech))
+            all_speech.extend(speech_j)
 
-            if len(sorted_data) > 0 and len(sorted_data[0]) > 0:
-                batch_size = max(batch_size, sorted_data[0][0][1] - sorted_data[0][0][0])
+        if max_len_in_batch == 0:  # all silence, return empty result
+            return [{"key": "", "text": "", "timestamp": []}]
 
-            beg_idx = 0
-            beg_asr_total = time.time()
-            time_speech_total_per_sample = speech_lengths / 16000
-            time_speech_total_all_samples += time_speech_total_per_sample
+        all_result = []
+        stride = batch_size_threshold_ms * 16 // max_len_in_batch
+        for i in range(0, len(all_speech), stride):
+            batch_speech = all_speech[i:min(i + stride, len(all_speech))]
+            results = self.inference(
+                batch_speech, input_len=None, model=model, kwargs=kwargs, **cfg
+            )
+            num_results = len(results)
+            if len(batch_speech) != num_results:
+                assert len(batch_speech) >= num_results
+                for _ in range(len(batch_speech) - num_results):
+                    results.append({"key": "", "text": "", "timestamp": []})
+            all_result.extend(results)
 
-            # pbar_sample = tqdm(colour="blue", total=n, dynamic_ncols=True)
+        assert len(all_result) == sum([len(r['value']) for r in res])
+        beg_idx = 0
+        for i in range(len(res)):
+            key = res[i]["key"]
+            vadsegments = res[i]["value"]
+            n = len(vadsegments)
+            sentence_result = {}
 
-            all_segments = []
-            max_len_in_batch = 0
-            end_idx = 1
-            for j, _ in enumerate(range(0, n)):
-                # pbar_sample.update(1)
-                sample_length = sorted_data[j][0][1] - sorted_data[j][0][0]
-                potential_batch_length = max(max_len_in_batch, sample_length) * (j + 1 - beg_idx)
-                # batch_size_ms_cum += sorted_data[j][0][1] - sorted_data[j][0][0]
-                if (
-                    j < n - 1
-                    and sample_length < batch_size_threshold_ms
-                    and potential_batch_length < batch_size
-                ):
-                    max_len_in_batch = max(max_len_in_batch, sample_length)
-                    end_idx += 1
-                    continue
-
-                speech_j, speech_lengths_j = slice_padding_audio_samples(
-                    speech, speech_lengths, sorted_data[beg_idx:end_idx]
-                )
-                results = self.inference(
-                    speech_j, input_len=None, model=model, kwargs=kwargs, **cfg
-                )
-                if self.spk_model is not None:
-                    # compose vad segments: [[start_time_sec, end_time_sec, speech], [...]]
-                    for _b in range(len(speech_j)):
-                        vad_segments = [
-                            [
-                                sorted_data[beg_idx:end_idx][_b][0][0] / 1000.0,
-                                sorted_data[beg_idx:end_idx][_b][0][1] / 1000.0,
-                                np.array(speech_j[_b]),
-                            ]
-                        ]
-                        segments = sv_chunk(vad_segments)
-                        all_segments.extend(segments)
-                        speech_b = [i[2] for i in segments]
-                        spk_res = self.inference(
-                            speech_b, input_len=None, model=self.spk_model, kwargs=kwargs, **cfg
-                        )
-                        results[_b]["spk_embedding"] = spk_res[0]["spk_embedding"]
-                beg_idx = end_idx
-                end_idx += 1
-                max_len_in_batch = sample_length
-                if len(results) < 1:
-                    continue
-                results_sorted.extend(results)
-
-            # end_asr_total = time.time()
-            # time_escape_total_per_sample = end_asr_total - beg_asr_total
-            # pbar_sample.update(1)
-            # pbar_sample.set_description(f"rtf_avg_per_sample: {time_escape_total_per_sample / time_speech_total_per_sample:0.3f}, "
-            #                      f"time_speech_total_per_sample: {time_speech_total_per_sample: 0.3f}, "
-            #                      f"time_escape_total_per_sample: {time_escape_total_per_sample:0.3f}")
-
-            if len(results_sorted) != n:
-                results_ret_list.append({"key": key, "text": "", "timestamp": []})
-                logging.info("decoding, utt: {}, empty result".format(key))
-                continue
-            restored_data = [0] * n
-            for j in range(n):
-                index = sorted_data[j][1]
-                restored_data[index] = results_sorted[j]
-            result = {}
-
-            # results combine for texts, timestamps, speaker embeddings and others
-            # TODO: rewrite for clean code
-            for j in range(n):
-                for k, v in restored_data[j].items():
+            for j, segment_result in enumerate(all_result[beg_idx:beg_idx + n]):
+                for k, v in segment_result.items():
                     if k.startswith("timestamp"):
-                        if k not in result:
-                            result[k] = []
-                        for t in restored_data[j][k]:
+                        if k not in sentence_result:
+                            sentence_result[k] = []
+                        for t in segment_result[k]:
                             t[0] += vadsegments[j][0]
                             t[1] += vadsegments[j][0]
-                        result[k].extend(restored_data[j][k])
+                        sentence_result[k].extend(segment_result[k])
                     elif k == "spk_embedding":
-                        if k not in result:
-                            result[k] = restored_data[j][k]
+                        if k not in sentence_result:
+                            sentence_result[k] = segment_result[k]
                         else:
-                            result[k] = torch.cat([result[k], restored_data[j][k]], dim=0)
+                            sentence_result[k] = torch.cat([sentence_result[k], segment_result[k]], dim=0)
                     elif "text" in k:
-                        if k not in result:
-                            result[k] = restored_data[j][k]
+                        if k not in sentence_result:
+                            sentence_result[k] = segment_result[k]
                         else:
-                            result[k] += " " + restored_data[j][k]
+                            sentence_result[k] += " " + segment_result[k]
                     else:
-                        if k not in result:
-                            result[k] = restored_data[j][k]
+                        if k not in sentence_result:
+                            sentence_result[k] = segment_result[k]
                         else:
-                            result[k] += restored_data[j][k]
+                            sentence_result[k] += segment_result[k]
 
             return_raw_text = kwargs.get("return_raw_text", False)
-            # step.3 compute punc model
             if self.punc_model is not None:
-                if not len(result["text"].strip()):
+                if not len(sentence_result["text"].strip()):
                     if return_raw_text:
-                        result["raw_text"] = ""
+                        sentence_result["raw_text"] = ""
                 else:
                     deep_update(self.punc_kwargs, cfg)
                     punc_res = self.inference(
-                        result["text"], model=self.punc_model, kwargs=self.punc_kwargs, **cfg
+                        sentence_result["text"], model=self.punc_model, kwargs=self.punc_kwargs, **cfg
                     )
-                    raw_text = copy.copy(result["text"])
+                    raw_text = copy.copy(sentence_result["text"])
                     if return_raw_text:
-                        result["raw_text"] = raw_text
-                    result["text"] = punc_res[0]["text"]
+                        sentence_result["raw_text"] = raw_text
+                    sentence_result["text"] = punc_res[0]["text"]
             else:
                 raw_text = None
 
-            # speaker embedding cluster after resorted
-            if self.spk_model is not None and kwargs.get("return_spk_res", True):
-                if raw_text is None:
-                    logging.error("Missing punc_model, which is required by spk_model.")
-                all_segments = sorted(all_segments, key=lambda x: x[0])
-                spk_embedding = result["spk_embedding"]
-                labels = self.cb_model(
-                    spk_embedding.cpu(), oracle_num=kwargs.get("preset_spk_num", None)
-                )
-                # del result['spk_embedding']
-                sv_output = postprocess(all_segments, None, labels, spk_embedding.cpu())
-                if self.spk_mode == "vad_segment":  # recover sentence_list
-                    sentence_list = []
-                    for res, vadsegment in zip(restored_data, vadsegments):
-                        if "timestamp" not in res:
-                            logging.error(
-                                "Only 'iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch' \
-                                           and 'iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch'\
-                                           can predict timestamp, and speaker diarization relies on timestamps."
-                            )
-                        sentence_list.append(
-                            {
-                                "start": vadsegment[0],
-                                "end": vadsegment[1],
-                                "sentence": res["text"],
-                                "timestamp": res["timestamp"],
-                            }
-                        )
-                elif self.spk_mode == "punc_segment":
-                    if "timestamp" not in result:
-                        logging.error(
-                            "Only 'iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch' \
-                                       and 'iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch'\
-                                       can predict timestamp, and speaker diarization relies on timestamps."
-                        )
-                    if kwargs.get("en_post_proc", False):
-                        sentence_list = timestamp_sentence_en(
-                            punc_res[0]["punc_array"],
-                            result["timestamp"],
-                            raw_text,
-                            return_raw_text=return_raw_text,
-                        )
-                    else:
-                        sentence_list = timestamp_sentence(
-                            punc_res[0]["punc_array"],
-                            result["timestamp"],
-                            raw_text,
-                            return_raw_text=return_raw_text,
-                        )
-                distribute_spk(sentence_list, sv_output)
-                result["sentence_info"] = sentence_list
-            elif kwargs.get("sentence_timestamp", False):
-                if not len(result["text"].strip()):
-                    sentence_list = []
-                else:
-                    if kwargs.get("en_post_proc", False):
-                        sentence_list = timestamp_sentence_en(
-                            punc_res[0]["punc_array"],
-                            result["timestamp"],
-                            raw_text,
-                            return_raw_text=return_raw_text,
-                        )
-                    else:
-                        sentence_list = timestamp_sentence(
-                            punc_res[0]["punc_array"],
-                            result["timestamp"],
-                            raw_text,
-                            return_raw_text=return_raw_text,
-                        )
-                result["sentence_info"] = sentence_list
-            if "spk_embedding" in result:
-                del result["spk_embedding"]
-
-            result["key"] = key
-            results_ret_list.append(result)
-            end_asr_total = time.time()
-            time_escape_total_per_sample = end_asr_total - beg_asr_total
-            if pbar_total:
-                pbar_total.update(1)
-                pbar_total.set_description(
-                    f"rtf_avg: {time_escape_total_per_sample / time_speech_total_per_sample:0.3f}, "
-                    f"time_speech: {time_speech_total_per_sample: 0.3f}, "
-                    f"time_escape: {time_escape_total_per_sample:0.3f}"
-                )
+            # TODO(xcsong): add spk_model
+            sentence_result["key"] = key
+            results_ret_list.append(sentence_result)
+            beg_idx += n
 
         # end_total = time.time()
         # time_escape_total_all_samples = end_total - beg_total
