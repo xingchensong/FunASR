@@ -393,7 +393,7 @@ class AutoModel:
             key = res[i]["key"]
             vadsegments = res[i]["value"]
             n = len(vadsegments)
-            sentence_result = {}
+            sentence_result = {"text": ""}
 
             for j, segment_result in enumerate(all_result[beg_idx:beg_idx + n]):
                 for k, v in segment_result.items():
